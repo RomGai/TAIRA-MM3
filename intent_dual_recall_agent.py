@@ -13,6 +13,7 @@ Agent 3 (Routing & Recall Agent - LLM) responsibilities:
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -21,10 +22,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 try:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    try:
+        from transformers import AutoModel
+    except Exception:  # pragma: no cover
+        AutoModel = None
 except Exception:  # pragma: no cover
     torch = None
     AutoModelForCausalLM = None
     AutoTokenizer = None
+    AutoModel = None
 
 
 @dataclass
@@ -178,6 +184,36 @@ class Qwen3RouterLLM:
         )
 
 
+class Qwen3QueryEmbeddingModel:
+    """Query embedding wrapper for semantic history recall."""
+
+    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B") -> None:
+        self.model_name = model_name
+        self._tokenizer = None
+        self._model = None
+
+    def load(self) -> None:
+        if AutoTokenizer is None or AutoModel is None or torch is None:
+            raise ImportError("transformers/torch are not available for Qwen3QueryEmbeddingModel.")
+        if self._tokenizer is not None and self._model is not None:
+            return
+        self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self._model = AutoModel.from_pretrained(self.model_name, torch_dtype="auto", device_map="auto")
+
+    def encode(self, text: str) -> List[float]:
+        self.load()
+        clean_text = (text or "").strip() or "empty_query"
+        inputs = self._tokenizer([clean_text], padding=True, truncation=True, return_tensors="pt")
+        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = self._model(**inputs)
+            hidden = outputs.last_hidden_state
+            mask = inputs["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+            normalized = torch.nn.functional.normalize(pooled, p=2, dim=1)
+        return normalized[0].detach().cpu().tolist()
+
+
 class GlobalHistoryAccessor:
     """Read-only accessor over module-1 output databases."""
 
@@ -196,6 +232,53 @@ class GlobalHistoryAccessor:
         clean_path = [str(x).strip() for x in path if str(x).strip()]
         item_type = str(taxonomy.get("item_type", "")).strip()
         return clean_path, item_type
+
+    @staticmethod
+    def _extract_item_embedding(profile: Dict[str, Any]) -> Optional[List[float]]:
+        if not isinstance(profile, dict):
+            return None
+
+        candidate_keys = [
+            "embedding",
+            "dense_embedding",
+            "semantic_embedding",
+            "item_embedding",
+        ]
+        for key in candidate_keys:
+            vec = profile.get(key)
+            if isinstance(vec, list) and vec:
+                try:
+                    return [float(x) for x in vec]
+                except (TypeError, ValueError):
+                    continue
+
+        emb_group = profile.get("embeddings", {})
+        if isinstance(emb_group, dict):
+            for key in ["item", "text", "semantic", "dense"]:
+                vec = emb_group.get(key)
+                if isinstance(vec, list) and vec:
+                    try:
+                        return [float(x) for x in vec]
+                    except (TypeError, ValueError):
+                        continue
+        return None
+
+    @staticmethod
+    def _cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
+        if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+            return -1.0
+        dot = 0.0
+        norm_a = 0.0
+        norm_b = 0.0
+        for a, b in zip(vec_a, vec_b):
+            af = float(a)
+            bf = float(b)
+            dot += af * bf
+            norm_a += af * af
+            norm_b += bf * bf
+        if norm_a <= 0 or norm_b <= 0:
+            return -1.0
+        return float(dot / (math.sqrt(norm_a) * math.sqrt(norm_b)))
 
     def category_catalog(self) -> Tuple[List[str], List[str]]:
         categories: set[str] = set()
@@ -350,6 +433,82 @@ class GlobalHistoryAccessor:
             )
             if len(results) >= max_rows:
                 break
+        return results
+
+    def recall_user_history_by_query_embedding(
+        self,
+        user_id: str,
+        query_embedding: Sequence[float],
+        top_k: int = 20,
+        max_rows: int = 300,
+    ) -> List[Dict[str, Any]]:
+        """Semantic recall over user history using global item embeddings only."""
+        rows = self.history_conn.execute(
+            """
+            SELECT user_id, item_id, behavior, timestamp, profile_json, created_at
+            FROM user_history_profiles
+            WHERE user_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (str(user_id), int(max_rows)),
+        ).fetchall()
+        if not rows:
+            return []
+
+        latest_row_by_item: Dict[str, sqlite3.Row] = {}
+        for row in rows:
+            item_id = str(row["item_id"]).strip()
+            if not item_id or item_id in latest_row_by_item:
+                continue
+            latest_row_by_item[item_id] = row
+
+        item_ids = list(latest_row_by_item.keys())
+        if not item_ids:
+            return []
+
+        global_rows = self.global_conn.execute(
+            "SELECT item_id, profile_json FROM global_item_features"
+        ).fetchall()
+        global_profile_map: Dict[str, Dict[str, Any]] = {}
+        for row in global_rows:
+            iid = str(row["item_id"]).strip()
+            if iid in latest_row_by_item:
+                try:
+                    global_profile_map[iid] = json.loads(row["profile_json"])
+                except json.JSONDecodeError:
+                    continue
+
+        scored: List[Tuple[float, str]] = []
+        for item_id in item_ids:
+            global_profile = global_profile_map.get(item_id)
+            if not global_profile:
+                continue
+            item_emb = self._extract_item_embedding(global_profile)
+            if not item_emb:
+                continue
+            sim = self._cosine_similarity(query_embedding, item_emb)
+            scored.append((sim, item_id))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        picked_item_ids = [iid for _, iid in scored[: max(1, int(top_k))]]
+
+        results: List[Dict[str, Any]] = []
+        for item_id in picked_item_ids:
+            row = latest_row_by_item[item_id]
+            profile = json.loads(row["profile_json"])
+            results.append(
+                {
+                    "user_id": row["user_id"],
+                    "item_id": row["item_id"],
+                    "behavior": row["behavior"],
+                    "timestamp": row["timestamp"],
+                    "profile": profile,
+                    "created_at": row["created_at"],
+                    "semantic_similarity": next((s for s, iid in scored if iid == item_id), None),
+                    "embedding_source": "global_item_features",
+                }
+            )
         return results
 
     def recall_user_history_all(
@@ -507,9 +666,15 @@ class GlobalHistoryAccessor:
 class RoutingRecallAgent:
     """Agent 3: routing + dual recall."""
 
-    def __init__(self, llm: Qwen3RouterLLM, accessor: GlobalHistoryAccessor) -> None:
+    def __init__(
+        self,
+        llm: Qwen3RouterLLM,
+        accessor: GlobalHistoryAccessor,
+        query_embedding_model: Optional[Qwen3QueryEmbeddingModel] = None,
+    ) -> None:
         self.llm = llm
         self.accessor = accessor
+        self.query_embedding_model = query_embedding_model
 
     def run(
         self,
@@ -518,6 +683,7 @@ class RoutingRecallAgent:
         min_candidate_items: int = 20,
         max_candidate_items: int = 200,
         max_history_rows: int = 200,
+        semantic_history_top_k: int = 20,
         history_category_paths_k: int = 3,
         query_category_paths_k: int = 3,
         interested_item_types_k: int = 3,
@@ -571,12 +737,29 @@ class RoutingRecallAgent:
             final_rollup_paths = [list(p) for p in routing.category_paths]
 
         if clean_query:
-            history_rows = self.accessor.recall_user_history(
-                user_id=user_id,
-                target_paths=final_rollup_paths,
-                target_item_types=routing.item_types,
-                max_rows=max_history_rows,
-            )
+            history_rows: List[Dict[str, Any]] = []
+            semantic_error = ""
+            if self.query_embedding_model is not None:
+                try:
+                    query_embedding = self.query_embedding_model.encode(clean_query)
+                    history_rows = self.accessor.recall_user_history_by_query_embedding(
+                        user_id=user_id,
+                        query_embedding=query_embedding,
+                        top_k=semantic_history_top_k,
+                        max_rows=max_history_rows,
+                    )
+                except Exception as exc:  # pragma: no cover
+                    semantic_error = str(exc)
+
+            if not history_rows:
+                history_rows = self.accessor.recall_user_history(
+                    user_id=user_id,
+                    target_paths=final_rollup_paths,
+                    target_item_types=routing.item_types,
+                    max_rows=max_history_rows,
+                )
+            if semantic_error:
+                routing.reasoning = f"{routing.reasoning} | semantic_history_fallback={semantic_error}"
         else:
             history_rows = self.accessor.recall_user_history_all(
                 user_id=user_id,
@@ -604,6 +787,8 @@ class RoutingRecallAgent:
                 "history_category_paths_k": max(1, int(history_category_paths_k)),
                 "query_category_paths_k": max(1, int(query_category_paths_k)),
                 "interested_item_types_k": max(1, int(interested_item_types_k)),
+                "semantic_history_top_k": max(1, int(semantic_history_top_k)),
+                "semantic_history_enabled": self.query_embedding_model is not None,
                 "history_top_item_types": history_top_item_types,
                 "exclude_seen_items": bool(exclude_seen_items),
                 "seen_history_lookback": int(seen_history_lookback),
@@ -641,12 +826,14 @@ if __name__ == "__main__":
         global_db_path="./processed/global_item_features.db",
         history_db_path="./processed/user_history_log.db",
     )
-    agent = RoutingRecallAgent(llm=llm, accessor=accessor)
+    query_emb = Qwen3QueryEmbeddingModel(model_name="Qwen/Qwen3-Embedding-0.6B")
+    agent = RoutingRecallAgent(llm=llm, accessor=accessor, query_embedding_model=query_emb)
 
     out = agent.run(
         user_id="0",
         query="", #我想找适合客厅多人玩的体感游戏
         min_candidate_items=10,
+        semantic_history_top_k=20,
         query_category_paths_k=2,
         history_category_paths_k=3,
         save_output=True,

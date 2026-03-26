@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover
 
 try:
     from dynamic_reasoning_ranking_agent import run_module3
+    from image_prefetch import prefetch_item_images
     from item_profiler_agents import (
         GlobalItemDB,
         HistoryItemProfileInput,
@@ -28,8 +29,10 @@ try:
         UserHistoryLogDB,
     )
     from intent_dual_recall_agent import Qwen3RouterLLM
+    from qwen3_vl_embedding import Qwen3VLEmbedder
 except ModuleNotFoundError:
     from new_pipe.dynamic_reasoning_ranking_agent import run_module3
+    from new_pipe.image_prefetch import prefetch_item_images
     from new_pipe.item_profiler_agents import (
         GlobalItemDB,
         HistoryItemProfileInput,
@@ -38,6 +41,7 @@ except ModuleNotFoundError:
         UserHistoryLogDB,
     )
     from new_pipe.intent_dual_recall_agent import Qwen3RouterLLM
+    from new_pipe.qwen3_vl_embedding import Qwen3VLEmbedder
 
 EN_STOPWORDS = {
     "a", "an", "the", "and", "or", "to", "for", "with", "of", "in", "on", "at", "from", "by",
@@ -96,6 +100,29 @@ def _item_sentence(meta: Dict[str, Any]) -> str:
 def _query_sentence(query: str, selected_categories: List[List[str]], rewritten: str) -> str:
     cats = " | ".join(" > ".join(seg for seg in c if seg) for c in selected_categories)
     return f"categories: {cats}; user_need: {rewritten or query}".strip()
+
+
+def _safe_meta_image(meta: Dict[str, Any]) -> str:
+    return str(meta.get("imUrl", "") or "").strip()
+
+
+def _build_qwen3vl_item_input(
+    meta: Dict[str, Any],
+    image_url_to_local: Dict[str, str] | None = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"text": _item_sentence(meta)}
+    image = _safe_meta_image(meta)
+    if image and image_url_to_local:
+        image = image_url_to_local.get(image, image)
+    if image:
+        payload["image"] = image
+    return payload
+
+
+def _tensor_to_float32_numpy(emb: Any) -> np.ndarray:
+    if torch is not None and isinstance(emb, torch.Tensor):
+        return emb.detach().to(torch.float32).cpu().numpy()
+    return np.asarray(emb, dtype=np.float32)
 
 
 def _safe_json_load(path: Path, default: Any) -> Any:
@@ -218,6 +245,65 @@ def _build_item_embedding_cache(
     return final_emb
 
 
+def _build_qwen3vl_item_embedding_cache(
+    qwen3vl_model: Qwen3VLEmbedder,
+    all_item_ids: List[str],
+    meta_map: Dict[str, Dict[str, Any]],
+    emb_cache_path: Path,
+    chunk_size: int,
+    save_every_items: int,
+    image_url_to_local: Dict[str, str] | None = None,
+) -> np.ndarray:
+    total = len(all_item_ids)
+    print(f"[Agent3][Qwen3VL] rebuilding multimodal embedding cache for {total} items")
+    emb_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    parts_dir = emb_cache_path.parent / f"{emb_cache_path.stem}_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    for old_part in sorted(parts_dir.glob("part_*.npz")):
+        old_part.unlink()
+    pending_ids: List[str] = []
+    pending_emb_chunks: List[np.ndarray] = []
+    saved_part_paths: List[Path] = []
+    part_idx = 0
+
+    def _flush_pending() -> None:
+        nonlocal part_idx, pending_ids, pending_emb_chunks
+        if not pending_ids:
+            return
+        part_idx += 1
+        part_path = parts_dir / f"part_{part_idx:06d}.npz"
+        part_emb = np.concatenate(pending_emb_chunks, axis=0)
+        np.savez_compressed(part_path, item_ids=np.array(pending_ids), item_embeddings=part_emb)
+        saved_part_paths.append(part_path)
+        print(f"[Agent3][Qwen3VL][part save] {part_path.name} rows={len(pending_ids)}")
+        pending_ids = []
+        pending_emb_chunks = []
+
+    for start in range(0, total, chunk_size):
+        end = min(total, start + chunk_size)
+        chunk_item_ids = all_item_ids[start:end]
+        chunk_inputs = [_build_qwen3vl_item_input(meta_map[iid], image_url_to_local=image_url_to_local) for iid in chunk_item_ids]
+        chunk_emb = _tensor_to_float32_numpy(qwen3vl_model.process(chunk_inputs))
+        pending_emb_chunks.append(chunk_emb)
+        pending_ids.extend(chunk_item_ids)
+        print(f"[Agent3][Qwen3VL][embedding chunk] {end}/{total} (chunk={start}-{end})")
+        if len(pending_ids) >= max(1, int(save_every_items)):
+            _flush_pending()
+
+    _flush_pending()
+    if not saved_part_paths:
+        raise ValueError("Failed to build Qwen3-VL embedding cache: no parts saved.")
+    all_parts = [np.load(p, allow_pickle=True)["item_embeddings"].astype(np.float32, copy=False) for p in saved_part_paths]
+    final_emb = np.concatenate(all_parts, axis=0)
+    np.savez_compressed(emb_cache_path, item_ids=np.array(all_item_ids), item_embeddings=final_emb)
+    for p in saved_part_paths:
+        p.unlink()
+    if parts_dir.exists() and not any(parts_dir.iterdir()):
+        parts_dir.rmdir()
+    print(f"[Agent3][Qwen3VL][cache save] {total}/{total} -> {emb_cache_path}")
+    return final_emb
+
+
 def _l2_normalize(matrix: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     return matrix / np.clip(norms, 1e-12, None)
@@ -284,6 +370,18 @@ def _build_hybrid_recall_ids(
         "fixed_recall_topk": recall_topk,
     }
     return merged_ids, len(merged_ids), debug
+
+
+def _merge_unique_ids(*id_lists: List[str]) -> List[str]:
+    merged: List[str] = []
+    seen = set()
+    for ids in id_lists:
+        for iid in ids:
+            if iid in seen:
+                continue
+            seen.add(iid)
+            merged.append(iid)
+    return merged
 
 
 def _filter_item_ids_by_categories(
@@ -479,6 +577,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     cache_dir = Path(args.cache_dir)
     emb_cache_path = cache_dir / "agent3_item_embedding_cache.npz"
+    qwen3vl_emb_cache_path = cache_dir / "agent3_item_qwen3vl_embedding_cache.npz"
     text_cache_path = cache_dir / "agent3_text_cache.json"
 
     text_cache = _safe_json_load(text_cache_path, {"items": {}, "queries": {}})
@@ -508,6 +607,36 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         )
 
     item_emb_norm = _l2_normalize(item_emb_matrix)
+    qwen3vl_model = None
+    qwen3vl_item_emb_norm: np.ndarray | None = None
+    if args.enable_agent3_qwen3vl_embedding:
+        print(f"[Init] load multimodal embedding model: {args.agent3_qwen3vl_model}")
+        image_cache_dir = cache_dir / "agent3_qwen3vl_images"
+        image_url_to_local = prefetch_item_images(
+            meta_map=meta_map,
+            resolve_image_fn=_safe_meta_image,
+            cache_dir=image_cache_dir,
+            max_workers=max(1, int(args.agent3_qwen3vl_prefetch_workers)),
+            timeout_sec=max(1, int(args.agent3_qwen3vl_prefetch_timeout)),
+        )
+        qwen3vl_model = Qwen3VLEmbedder(model_name_or_path=args.agent3_qwen3vl_model)
+        q_item_ids_cached: List[str] = []
+        q_item_emb_matrix: np.ndarray | None = None
+        if qwen3vl_emb_cache_path.exists():
+            q_npz = np.load(qwen3vl_emb_cache_path, allow_pickle=True)
+            q_item_ids_cached = [str(x) for x in q_npz["item_ids"].tolist()]
+            q_item_emb_matrix = q_npz["item_embeddings"].astype(np.float32, copy=False)
+        if q_item_emb_matrix is None or q_item_ids_cached != all_item_ids:
+            q_item_emb_matrix = _build_qwen3vl_item_embedding_cache(
+                qwen3vl_model=qwen3vl_model,
+                all_item_ids=all_item_ids,
+                meta_map=meta_map,
+                emb_cache_path=qwen3vl_emb_cache_path,
+                chunk_size=max(1, int(args.agent3_qwen3vl_chunk_size)),
+                save_every_items=max(1, int(args.agent3_qwen3vl_save_every)),
+                image_url_to_local=image_url_to_local,
+            )
+        qwen3vl_item_emb_norm = _l2_normalize(q_item_emb_matrix)
     global_db = GlobalItemDB(args.global_db)
     history_db = UserHistoryLogDB(args.history_db)
     vl_extractor = Qwen3VLExtractor(model_name=args.vl_model) if args.enable_vl_profiling else None
@@ -589,6 +718,28 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             rank_indices=rank_indices,
             fixed_recall_topk=args.fixed_recall_topk,
         )
+        if args.enable_agent3_qwen3vl_embedding and qwen3vl_model is not None and qwen3vl_item_emb_norm is not None:
+            qwen3vl_query_input = {"text": q_sentence}
+            query_image = str(row.get("query_image") or row.get("image") or row.get("image_url") or "").strip()
+            if query_image:
+                if query_image in image_url_to_local:
+                    query_image = image_url_to_local[query_image]
+                qwen3vl_query_input["image"] = query_image
+            qwen3vl_q_emb = _tensor_to_float32_numpy(qwen3vl_model.process([qwen3vl_query_input]))
+            qwen3vl_q_emb_norm = _l2_normalize(qwen3vl_q_emb)[0]
+            q_filtered_emb = qwen3vl_item_emb_norm[np.array(filtered_idx)]
+            qwen3vl_sim = np.matmul(q_filtered_emb, qwen3vl_q_emb_norm)
+            qwen3vl_rank_indices = np.argsort(-qwen3vl_sim)
+            mm_topk = max(1, int(args.agent3_qwen3vl_topk))
+            qwen3vl_ids = [filtered_item_ids[int(idx)] for idx in qwen3vl_rank_indices[:mm_topk]]
+            top_ids = _merge_unique_ids(top_ids, qwen3vl_ids)
+            used_k = len(top_ids)
+            kw_debug["qwen3vl_enabled"] = True
+            kw_debug["qwen3vl_topk"] = mm_topk
+            kw_debug["qwen3vl_pool_size"] = len(qwen3vl_ids)
+            kw_debug["merged_pool_size"] = len(top_ids)
+        else:
+            kw_debug["qwen3vl_enabled"] = False
         print(
             f"[Agent3][keyword] keywords={kw_debug['keywords']} matched={kw_debug['keyword_matched_count']} "
             f"stage={kw_debug['keyword_stage']} prefilter_size={len(filtered_item_ids)}"
@@ -721,6 +872,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embed-chunk-size", type=int, default=20000)
     parser.add_argument("--embed-save-every", type=int, default=20000)
     parser.add_argument("--fixed-recall-topk", type=int, default=250, help="Agent3标题关键词召回和embedding召回各自采用的固定Top-K。")
+    parser.add_argument("--enable-agent3-qwen3vl-embedding", action="store_true", help="开启后，Agent3新增一路Qwen3-VL多模态embedding召回（文本+图片）。默认关闭。")
+    parser.add_argument("--agent3-qwen3vl-topk", type=int, default=25, help="Agent3新增Qwen3-VL多模态embedding召回Top-K。")
+    parser.add_argument("--agent3-qwen3vl-model", default="Qwen/Qwen3-VL-Embedding-2B", help="Agent3多模态embedding模型名称。")
+    parser.add_argument("--agent3-qwen3vl-chunk-size", type=int, default=256, help="Qwen3-VL多模态embedding建库分块大小。")
+    parser.add_argument("--agent3-qwen3vl-save-every", type=int, default=1000, help="Qwen3-VL embedding每累计多少条落盘一次part文件，最后再合并。")
+    parser.add_argument("--agent3-qwen3vl-prefetch-workers", type=int, default=16, help="Qwen3-VL图片预下载并发数。")
+    parser.add_argument("--agent3-qwen3vl-prefetch-timeout", type=int, default=8, help="Qwen3-VL图片预下载超时秒数。")
     parser.add_argument("--max-query-keywords", type=int, default=10)
     parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--max-users", type=int, default=0, help="仅跑前N条query，0表示全量")

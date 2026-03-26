@@ -65,7 +65,10 @@
 
 #### 路 B：用户历史精准召回
 - 在 `user_history_profiles` 中按 `user_id` 拉取最近记录。
-- 使用与路 A 相同的类目/类型匹配逻辑过滤。
+- 当 query 非空且启用 query embedding 模型时，优先走“query 向量 vs 用户历史商品向量”的语义召回：
+  - 历史商品向量不重复计算，直接从 `global_item_features.profile_json` 里读取 embedding 字段；
+  - 默认取 Top-20（`semantic_history_top_k` 可配置），若不足 20 则按实际数量返回。
+- 若语义召回不可用（例如 embedding 缺失/模型不可用），自动回退到原有类目/类型匹配逻辑。
 - 返回 query 高相关历史交互记录（保留 `behavior` 和 `timestamp`）。
 
 ## 3. Qwen3 调用方式
@@ -94,19 +97,26 @@
 ## 5. 最小使用示例
 
 ```python
-from intent_dual_recall_agent import Qwen3RouterLLM, GlobalHistoryAccessor, RoutingRecallAgent
+from intent_dual_recall_agent import (
+    Qwen3RouterLLM,
+    Qwen3QueryEmbeddingModel,
+    GlobalHistoryAccessor,
+    RoutingRecallAgent,
+)
 
 llm = Qwen3RouterLLM(model_name="Qwen/Qwen3-8B")
+query_emb = Qwen3QueryEmbeddingModel(model_name="Qwen/Qwen3-Embedding-0.6B")
 accessor = GlobalHistoryAccessor(
     global_db_path="./processed/global_item_features.db",
     history_db_path="./processed/user_history_log.db",
 )
-agent = RoutingRecallAgent(llm=llm, accessor=accessor)
+agent = RoutingRecallAgent(llm=llm, accessor=accessor, query_embedding_model=query_emb)
 
 result = agent.run(
     user_id="123",
     query="想买适合两个人客厅联机的体感游戏",
     min_candidate_items=20,
+    semantic_history_top_k=20,
 )
 
 print(result.candidate_items[:3])
